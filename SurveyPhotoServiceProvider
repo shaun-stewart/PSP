@@ -1,0 +1,727 @@
+define([
+    'owf/app/behaviour/coreUtils',
+    'dojo/promise/all',
+    'owf/security/jwtStorage',
+    'dojo/string',
+    'owf/lang/async',
+    'dojo/_base/lang',
+    'owf/lang/Deferred',
+    'pmm/owcRt/photos/PhotoServiceProvider',
+    'dojo/_base/declare'
+], function (coreUtils, all, jwtStorage, string, async, lang, Deferred, PhotoServiceProvider, declare) {
+
+    'use strict';
+
+    /**
+     * issues to keep an eye on:
+     * https://github.com/techfort/LokiJS/issues/620
+     * https://stackoverflow.com/questions/12084177/in-indexeddb-is-there-a-way-to-make-a-sorted-compound-query
+     * https://bugs.webkit.org/show_bug.cgi?id=178995 - cursor update issues
+     * https://bugs.webkit.org/show_bug.cgi?id=178995 - cursor update issues
+     */
+
+    function makeRequestAPromise(request) {
+        var deferred = new Deferred();
+        request.onsuccess = function (event) {
+            deferred.resolve(event.target.result);
+        };
+        request.onerror = function () {
+            deferred.reject(request.error);
+            if (request.error && request.error.name) {
+                console.error("Error occurred in Photo Service Provider: " + request.error.name + " ... " + request.error.message);
+            } else {
+                console.error("Error occurred withing the photo service provider. ");
+            }
+        };
+        return deferred.promise;
+    }
+
+    function PhotoObj(obj) {
+        this.id = obj.id;
+        this.lo_code = obj.lo_code;
+        this.local_survey_id = obj.local_survey_id;
+        this.timestamp = obj.timestamp;
+        this.user = obj.user;
+        // convert back to a Blob before returning object
+        this.photo = new Blob([obj.photo], {type: obj.type});
+        this.survey_id = obj.survey_id;
+        this.state = obj.state;
+    }
+
+    var PHOTO_STATE_ENUM = Object.freeze({ADDED: 'added', SAVED: 'saved', UPLOADED: 'uploaded'});
+
+    return declare(PhotoServiceProvider, {
+
+        PHOTO_STATE_ENUM: PHOTO_STATE_ENUM,
+
+        _onUpgradeNeeded: function (IDBVersionChangeEvent) {
+            var db = IDBVersionChangeEvent.target.result;
+            var store = db.createObjectStore(this.storeName, {keyPath: 'id', autoIncrement: true});
+            store.createIndex('lo_code', 'lo_code');
+            store.createIndex('local_survey_id', 'local_survey_id');
+            store.createIndex('state', 'state');
+            // we only create one composite key to limit any problems that can arise using this method
+            // https://stackoverflow.com/questions/12084177/in-indexeddb-is-there-a-way-to-make-a-sorted-compound-query
+            store.createIndex('lo_code_local_survey_id', ['lo_code', 'local_survey_id']);
+            console.log('Successfully added ' + store.name + ' object store to ' + db.name + ' database');
+        },
+
+        _errorHandler: function (event) {
+            if (event.target.error && event.target.error.name) {
+                console.error("An error occurred in Photo Service Provider: " + event.target.error.name + " ... " + event.target.error.message);
+            } else {
+                console.error("An error occurred in Photo Service Provider. ");
+            }
+        },
+
+        _connect: function (IDBOpenDBRequest) {
+            var deferred = new Deferred();
+            var self = this;
+
+            IDBOpenDBRequest.addEventListener('upgradeneeded', function onUpgradeNeeded(IDBVersionChangeEvent) {
+                self._onUpgradeNeeded(IDBVersionChangeEvent);
+                IDBOpenDBRequest.removeEventListener('upgradeneeded', onUpgradeNeeded, false);
+            });
+
+            IDBOpenDBRequest.addEventListener('success', function onSuccess() {
+                deferred.resolve(event.target.result);
+                IDBOpenDBRequest.removeEventListener('success', onSuccess, false);
+            });
+
+            IDBOpenDBRequest.addEventListener('error', function onError() {
+                deferred.reject(IDBOpenDBRequest.error);
+                IDBOpenDBRequest.removeEventListener('error', onError, false);
+            });
+
+            return deferred.promise;
+        },
+
+        _callOnStore: function (method, args, index, returnRequest) {
+            // calls a method on the IndexedDB store
+            var self = this;
+            var request;
+            return self.connect().then(function (connection) {
+                // todo make transaction type dynamic ie allow for read instead of always readwrite
+                var tx = connection.transaction([self.storeName], 'readwrite');
+                tx.oncomplete = function () {
+                    connection.close();
+                };
+                tx.onerror = self._errorHandler;
+                try {
+                    var store = tx.objectStore(self.storeName);
+                    if (index) {
+                        store = store.index(index);
+                    }
+                    request = store[method].apply(store, args);
+                } catch (e) {
+                    throw e;
+                }
+
+                return returnRequest ? request : makeRequestAPromise(request);
+            });
+        },
+
+        _photoUploadSuccessCallback: function (id) {
+            var self = this;
+            return self._callOnStore('get', [id]).then(function (photo) {
+                photo.state = PHOTO_STATE_ENUM.UPLOADED;
+
+                return self._callOnStore('put', [photo]);
+            });
+        },
+
+        /**
+         * Photos are only uploaded sequentially if they have been marked as saved and have a survey_id
+         * @param photos
+         * @returns {*|dojo|promise|Promise}
+         * @private
+         */
+        _uploadPhotos: function (photos) {
+            var self = this;
+            var uploadChain = new Deferred();
+            return async.when(jwtStorage.getToken(), function (token) {
+                uploadChain.resolve();
+                photos.forEach(function (photo) {
+                    var photoId = photo.id;
+
+                    var uploadUrl = string.substitute(self.uploadUrl, {
+                        loCode: photo.lo_code,
+                        surveyId: photo.survey_id
+                    });
+
+                    uploadChain = uploadChain
+                        .then(function () {
+                            return self.upload(token, uploadUrl, photo, self._photoUploadSuccessCallback.bind(self, photoId));
+                        });
+                });
+                return uploadChain;
+            });
+        },
+
+        _fetchKeysForPhotos: function (loCode, localSurveyId) {
+            var self = this;
+            var deferred = new Deferred();
+            var keyArr = [];
+
+            // rather than creating a composite key that has the lo_code, local_survey_id and primary key we use
+            // the simpler lo_code_local_survey_id composite key and check each value via the cursor.
+            // this is to prevent common issues that arise when using composite keys.
+            // https://stackoverflow.com/questions/12084177/in-indexeddb-is-there-a-way-to-make-a-sorted-compound-query
+            async.when(self._callOnStore('openCursor', [IDBKeyRange.only([loCode, localSurveyId])], 'lo_code_local_survey_id', true), function (cursorRequest) {
+                cursorRequest.onsuccess = function (event) {
+                    var cursor = event.target.result;
+                    if (cursor) {
+                        keyArr.push(cursor.primaryKey);
+                        cursor['continue']();
+                    } else {
+                        deferred.resolve(keyArr);
+                    }
+                };
+            });
+            return deferred.promise;
+        },
+
+        _fetchKeysForPhotosNotUploaded: function (loCode, localSurveyId) {
+            var self = this;
+            var deferred = new Deferred();
+            var keyArr = [];
+
+            // rather than creating a composite key that has the lo_code, local_survey_id and photo state we use
+            // the simpler lo_code_local_survey_id composite key and check each value via the cursor.
+            // this is to prevent common issues that arise when using composite keys.
+            // https://stackoverflow.com/questions/12084177/in-indexeddb-is-there-a-way-to-make-a-sorted-compound-query
+            async.when(self._callOnStore('openCursor', [IDBKeyRange.only([loCode, localSurveyId])], 'lo_code_local_survey_id', true), function (cursorRequest) {
+                cursorRequest.onsuccess = function (event) {
+                    var cursor = event.target.result;
+                    if (cursor) {
+                        if (cursor.value.state !== PHOTO_STATE_ENUM.UPLOADED) {
+                            keyArr.push(cursor.primaryKey);
+                        }
+                        cursor['continue']();
+                    } else {
+                        deferred.resolve(keyArr);
+                    }
+                };
+            });
+            return deferred.promise;
+        },
+
+        _fetchKeysForAllNonPersistedSurveyPhotos: function () {
+            var self = this;
+            var deferred = new Deferred();
+            var keyArr = [];
+
+            async.when(self._callOnStore('openCursor', [IDBKeyRange.only(PHOTO_STATE_ENUM.ADDED)], 'state', true), function (cursorRequest) {
+                cursorRequest.onsuccess = function (event) {
+                    var cursor = event.target.result;
+                    if (cursor) {
+                        keyArr.push(cursor.primaryKey);
+                        cursor['continue']();
+                    } else {
+                        deferred.resolve(keyArr);
+                    }
+                };
+            });
+            return deferred.promise;
+        },
+
+        _fetchKeysForNonPersistedSurveyPhotos: function (loCode, localSurveyId) {
+            var self = this;
+            var deferred = new Deferred();
+            var keyArr = [];
+
+            // rather than creating a composite key that has the lo_code, local_survey_id and photo state we use
+            // the simpler lo_code_local_survey_id composite key and check each value via the cursor.
+            // this is to prevent common issues that arise when using composite keys.
+            // https://stackoverflow.com/questions/12084177/in-indexeddb-is-there-a-way-to-make-a-sorted-compound-query
+            async.when(self._callOnStore('openCursor', [IDBKeyRange.only([loCode, localSurveyId])], 'lo_code_local_survey_id', true), function (cursorRequest) {
+                cursorRequest.onsuccess = function (event) {
+                    var cursor = event.target.result;
+                    if (cursor) {
+                        if (cursor.value.state === PHOTO_STATE_ENUM.ADDED) {
+                            keyArr.push(cursor.primaryKey);
+                        }
+                        cursor['continue']();
+                    } else {
+                        deferred.resolve(keyArr);
+                    }
+                };
+            });
+            return deferred.promise;
+        },
+
+        _fetchKeysForLocationPhotos: function (loCode) {
+            var self = this;
+            var deferred = new Deferred();
+            var keyArr = [];
+
+            async.when(self._callOnStore('openCursor', [IDBKeyRange.only(loCode)], 'lo_code', true), function (cursorRequest) {
+                cursorRequest.onsuccess = function (event) {
+                    var cursor = event.target.result;
+                    if (cursor) {
+                        keyArr.push(cursor.primaryKey);
+                        cursor['continue']();
+                    } else {
+                        deferred.resolve(keyArr);
+                    }
+                };
+            });
+            return deferred.promise;
+        },
+
+        /**
+         * The constructor takes in an open request so that multiple stores can be created on the same request.
+         * This is important as we need to be able to add event listeners to the same open request, as onUpgradeNeeded
+         * is only triggered when the db version is changed. As we only do this once (during initial creation) we need each
+         * instance of SurveyPhotoServiceProvider to have there onupgradeneeded to be triggered.
+         * @param IDBOpenDBRequest
+         * @param schema
+         */
+        constructor: function (IDBOpenDBRequest, schema) {
+            this.dbName = schema.dbName;
+            this.storeName = schema.storeName;
+            this.uploadUrl = schema.uploadUrl;
+            this.downloadUrl = schema.downloadUrl;
+            this._connect(IDBOpenDBRequest);
+        },
+
+        /**
+         * Creates and returns a connection to the db
+         * @returns {*} deferred which resolves to a connection to the db
+         */
+        connect: function () {
+            return this._connect(window.indexedDB.open(this.dbName));
+        },
+
+        /**
+         * Returns a deferred which resolves with an object
+         * {
+              'Store Name': string
+              'Items': number
+              'Size': number
+           }
+         *
+         * @returns {*}
+         */
+        getDatabaseSize: function () {
+            var self = this;
+            var deferred = new Deferred();
+
+            this.connect().then(function (conn) {
+                var tx = conn.transaction([self.storeName], 'readonly');
+                var szBytes = 0;
+                tx.oncomplete = function (evt) {
+                    deferred.resolve({
+                        'storeName': self.storeName,
+                        'sizeMB': (szBytes / 1024 / 1024)
+                    });
+                    conn.close();
+                };
+                tx.onerror = self._errorHandler;
+
+                var store = tx.objectStore(self.storeName);
+
+                var cursorRequest = store.openCursor();
+                cursorRequest.onerror = function (error) {
+                    deferred.reject(error);
+                };
+                cursorRequest.onsuccess = function (evt) {
+                    var cursor = evt.target.result;
+                    if (cursor) {
+                        var objectSize = (JSON.stringify(cursor.value).length * 2);
+                        // add size of photo object to size of actual photo array buffer
+                        szBytes += (objectSize + cursor.value.photo.byteLength);
+                        cursor['continue']();
+                    }
+                };
+            });
+
+            return deferred;
+        },
+
+        /**
+         * Retrieves a photo with a given id
+         * id: Number the identity to use to lookup the object
+         * @returns {*} dojo//Deferred resolves to a  photo object
+         */
+        fetchPhoto: function (id) {
+            return this._callOnStore('get', [id]).then(function (record) {
+                return (new PhotoObj(record));
+            });
+        },
+
+        /**
+         * Retrieves all photos for a given location and survey
+         * @param loCode
+         * @param localSurveyId
+         * @returns {*} deferred which resolves to an array of photo objects
+         */
+        fetchPhotos: function (loCode, localSurveyId) {
+            var self = this;
+            var deferred = new Deferred();
+            var photoArr = [];
+
+            async.when(self._callOnStore('openCursor', [IDBKeyRange.only([loCode, localSurveyId])], 'lo_code_local_survey_id', true), function (cursorRequest) {
+                cursorRequest.onsuccess = function (event) {
+                    var cursor = event.target.result;
+                    if (cursor) {
+                        photoArr.push(new PhotoObj(cursor.value));
+                        cursor['continue']();
+                    } else {
+                        deferred.resolve(photoArr);
+                    }
+                };
+            });
+            return deferred.promise;
+        },
+
+        /**
+         * Retrieves all photos that has a state of 'saved'
+         * @returns {*} deferred which resolves into an array of photo objects
+         */
+        fetchPhotosFlaggedForUpload: function () {
+            var self = this;
+            var deferred = new Deferred();
+            var photoArr = [];
+
+            async.when(self._callOnStore('openCursor', [IDBKeyRange.only(PHOTO_STATE_ENUM.SAVED)], 'state', true), function (cursorRequest) {
+                cursorRequest.onsuccess = function (event) {
+                    var cursor = event.target.result;
+                    if (cursor) {
+                        photoArr.push(new PhotoObj(cursor.value));
+                        cursor['continue']();
+                    } else {
+                        deferred.resolve(photoArr);
+                    }
+                };
+            });
+            return deferred.promise;
+        },
+        /**
+         * Retrieves all photos that have a state of 'saved' and have a survey_id
+         * @returns {*} deferred which resolves into an array of photo objects
+         */
+        fetchPhotosReadyForUpload: function () {
+            var self = this;
+            var deferred = new Deferred();
+            var photoArr = [];
+
+            async.when(self._callOnStore('openCursor', [IDBKeyRange.only(PHOTO_STATE_ENUM.SAVED)], 'state', true), function (cursorRequest) {
+                cursorRequest.onsuccess = function (event) {
+                    var cursor = event.target.result;
+                    if (cursor) {
+                        if (coreUtils.isDefinedAndNotNull(cursor.value.survey_id)) {
+                            photoArr.push(new PhotoObj(cursor.value));
+                        }
+                        cursor['continue']();
+                    } else {
+                        deferred.resolve(photoArr);
+                    }
+                };
+            });
+            return deferred.promise;
+        },
+
+        /**
+         * Retrieves count of photos that have a state of 'saved'
+         * @returns {*} deferred which resolves into count of photo objects
+         */
+        fetchCountOfPhotosFlaggedForUpload: function () {
+            var self = this;
+            var deferred = new Deferred();
+            var count = 0;
+
+            async.when(self._callOnStore('openCursor', [IDBKeyRange.only(PHOTO_STATE_ENUM.SAVED)], 'state', true), function (cursorRequest) {
+                cursorRequest.onsuccess = function (event) {
+                    var cursor = event.target.result;
+                    if (cursor) {
+                        count++;
+                        cursor['continue']();
+                    } else {
+                        deferred.resolve(count);
+                    }
+                };
+            });
+            return deferred.promise;
+        },
+
+        /**
+         * Retrieves the photo count for a given location and survey
+         * @param loCode
+         * @param localSurveyId
+         * @returns {*} resolves to the number of photos for the given location and survey
+         */
+        fetchPhotoCount: function (loCode, localSurveyId) {
+            return this._callOnStore('count', [IDBKeyRange.only([loCode, localSurveyId])], 'lo_code_local_survey_id');
+        },
+
+        /**
+         * todo refactor to use cursor when safari works as expected
+         * **Note**
+         * Safari issue.
+         * We are currently unable to use a cursor to iterate over and remove the photos.
+         * Instead we have to retrieve ids first and use them to delete
+         * from the object store directly.
+         * Removes photos from the db with an id found in the passed in array.
+         * @param ids - Array of ids of photos that will be removed from the db
+         */
+        removePhotosWithIds: function (ids) {
+            var self = this;
+            var deferred = new Deferred();
+            self.connect().then(function (conn) {
+                var tx = conn.transaction([self.storeName], 'readwrite');
+                tx.oncomplete = function () {
+                    conn.close();
+                };
+                tx.onerror = self._errorHandler;
+
+                var store = tx.objectStore(self.storeName);
+
+                (function loop(arr) {
+                    if (arr.length === 0) {
+                        deferred.resolve();
+                        return; // exit chain of loop calls
+                    }
+                    var id = arr.shift();
+
+                    var deleteRequest = store['delete'](id);
+                    deleteRequest.onsuccess = loop.bind(null, arr);
+                })(ids); // call immediately
+            });
+            return deferred.promise;
+
+        },
+
+        /**
+         * Removes all photos that have a photo state of 'added'
+         * @param loCode
+         * @param localSurveyId
+         */
+        removeAllNonPersistedPhotos: function () {
+            var self = this;
+            this._fetchKeysForAllNonPersistedSurveyPhotos().then(self.removePhotosWithIds.bind(self));
+        },
+
+        /**
+         * Removes all photos for a given location and survey that have a photo state of 'added'
+         * @param loCode
+         * @param localSurveyId
+         */
+        removeNonPersistedPhotos: function (loCode, localSurveyId) {
+            var self = this;
+            this._fetchKeysForNonPersistedSurveyPhotos(loCode, localSurveyId).then(self.removePhotosWithIds.bind(self));
+        },
+
+        /**
+         * Removes all photos with the corresponding locode from local storage.
+         * @param loCode
+         * @returns {*}
+         */
+        removePhotosWithLocode: function (loCode) {
+            var self = this;
+            return this._fetchKeysForLocationPhotos(loCode).then(function (ids) {
+                return self.removePhotosWithIds(ids);
+            });
+        },
+
+        /**
+         * Loops through photos and updates attribute on photo.
+         * @param ids - array of ids that will looped through
+         * @param attribute - object containing name and value attributes
+         * @returns {*}
+         * @private
+         */
+        _updatePhotos: function (ids, attribute) {
+            var self = this;
+            var deferred = new Deferred();
+            self.connect().then(function (conn) {
+                var tx = conn.transaction([self.storeName], 'readwrite');
+                tx.oncomplete = function () {
+                    conn.close();
+                };
+                tx.onerror = self._errorHandler;
+
+                var store = tx.objectStore(self.storeName);
+
+                (function loop(arr) {
+                    if (arr.length === 0) {
+                        deferred.resolve();
+                        return; // exit chain of loop calls
+                    }
+                    var id = arr.shift();
+
+                    var getRequest = store.get(id);
+                    getRequest.onsuccess = function (ev) {
+                        var data = ev.target.result;
+                        data[attribute.name] = attribute.value;
+                        var putRequest = store.put(data);
+                        putRequest.onsuccess = loop.bind(null, arr);
+                    };
+                })(ids); // call immediately
+            });
+            return deferred.promise;
+        },
+
+        /**
+         * todo refactor to use cursor when safari works as expected
+         * Updates the survey_id of the photo object.
+         * @param loCode
+         * @param localSurveyId
+         * @param surveyId
+         * @returns {*} deferred, resolved when survey_id has been successfully updated or an error occurs
+         */
+        updateSurveyIdOfPhotos: function (loCode, localSurveyId, surveyId) {
+            var self = this;
+
+            return this._fetchKeysForPhotos(loCode, localSurveyId).then(function (ids) {
+                return self._updatePhotos(ids, {name: 'survey_id', value: surveyId});
+            });
+        },
+
+        /**
+         * todo refactor to use cursor when safari works as expected
+         * https://bugs.webkit.org/show_bug.cgi?id=178995
+         * https://bugs.webkit.org/show_bug.cgi?id=178995
+         * If iterating an index the object being iterated must never be modified.
+         *
+         * Updates the state of the photo. If the photo has a state of 'uploaded', no change is made.
+         * This is because we cannot alter the state of photos on the server.
+         * @param loCode
+         * @param localSurveyId
+         * @param state
+         * @returns {*}
+         */
+        updateStateOfPhotos: function (loCode, localSurveyId, state) {
+            var self = this;
+
+            if (Object.values(PHOTO_STATE_ENUM).indexOf(state) === -1) {
+                console.error('Unable to assign invalid state');
+                return new Deferred().reject();
+            }
+
+            return this._fetchKeysForPhotosNotUploaded(loCode, localSurveyId).then(function (ids) {
+                return self._updatePhotos(ids, {name: 'state', value: state});
+            });
+        },
+
+        /**
+         * Attempts to upload any photos that have a state of 'saved' and have a survey_id
+         * Ensure updateSurveyIdOfPhotos has been called first so that photos have a survey_id
+         */
+        uploadSavedPhotos: function () {
+            var self = this;
+
+            return self.fetchPhotosReadyForUpload().then(function (photos) {
+                return self._uploadPhotos(photos);
+            });
+        },
+
+        _logErrorAndRejectDeferred: function (errorMsg, deferred) {
+            console.error(errorMsg);
+            deferred.reject();
+        },
+
+        /**
+         * Downloads any photos for a given location and survey
+         * @param loCode
+         * @param surveyId
+         * @returns {*} Deferred which is resolved when all photos are downloaded
+         */
+        downloadPhotos: function (loCode, surveyId) {
+            var req = new XMLHttpRequest();
+            var self = this;
+            var downloadUrl = string.substitute(this.downloadUrl, {loCode: loCode, surveyId: surveyId});
+            var returnedDeferred = new Deferred();
+            var deferreds = [];
+
+            async.when(jwtStorage.getToken(), function (token) {
+                req.open('GET', downloadUrl, true);
+                req.setRequestHeader('x-access-token', token);
+                req.onload = function (event) {
+
+                    if (event.target.status === 200) {
+                        if (typeof event.target.responseText === 'string') {
+                            var response = JSON.parse(event.target.responseText);
+
+                            if (Array.isArray(response)) {
+                                console.log('Downloading ' + response.length + ' Survey Photos');
+
+                                response.forEach(function (photo) {
+                                    deferreds.push((function downloadAndSavePhoto() {
+                                        var def = new Deferred();
+                                        self.download(token, photo.links.find(function (link) {
+                                            return link.rel === 'original';
+                                        }).href, function onPhotoDownloadSuccess(blob) {
+                                            self.save(blob, {
+                                                timestamp: photo.timestamp,
+                                                user: photo.user,
+                                                lo_code: loCode,
+                                                survey_id: surveyId,
+                                                local_survey_id: surveyId,
+                                                state: PHOTO_STATE_ENUM.UPLOADED
+                                            }).then(def.resolve, def.reject);
+                                        }, def.reject);
+                                        return def;
+                                    }()));
+                                });
+
+                                all(deferreds).then(returnedDeferred.resolve);
+
+                            } else {
+                                self._logErrorAndRejectDeferred('Expected survey photo download response to be formatted as array', returnedDeferred);
+                            }
+                        } else {
+                            self._logErrorAndRejectDeferred('Expected survey photo download responseText to be string. Instead we got type: ' + typeof event.target.responseText, returnedDeferred);
+                        }
+
+                    } else {
+                        self._logErrorAndRejectDeferred('status: ' + event.target.status + ' - ' + event.target.statusText, returnedDeferred);
+                    }
+                };
+                req.onerror = function () {
+                    // log error
+                    self._logErrorAndRejectDeferred('Unable to download survey photo with loCode: ' + loCode + ' and surveyId: ' + surveyId, returnedDeferred);
+                };
+                req.send();
+
+                return returnedDeferred;
+            });
+
+        },
+
+        /**
+         * Constructs an array buffer from the passed in blob and stores it along with the passed in data in
+         * an objectstore.
+         * ** Note **
+         * Safari issue storing blobs.
+         * https://stackoverflow.com/questions/40393488/mobile-safari-10-indexeddb-blobs
+         * @param blob
+         * @param data
+         * @returns {*}
+         */
+        save: function (blob, data) {
+            var deferred = new Deferred();
+            var self = this;
+
+            var reader = new FileReader();
+            reader.onload = function (loadEvent) {
+                self.connect().then(function (conn) {
+                    var tx = conn.transaction([self.storeName], 'readwrite');
+                    var store = tx.objectStore(self.storeName);
+                    var request = store.add(lang.mixin({
+                        photo: loadEvent.target.result, // ArrayBuffer
+                        type: blob.type
+                    }, data));
+                    request.onsuccess = function () {
+                        deferred.resolve(request.result);
+                        conn.close();
+                    };
+                });
+            };
+            // readAsArrayBuffer will give us a pointer to the FileSystem blob
+            reader.readAsArrayBuffer(blob);
+
+            return deferred;
+        }
+    });
+});
