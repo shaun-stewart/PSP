@@ -1,0 +1,345 @@
+define(['pmm/app/utils/objectUrl',
+    'owf/lang/Deferred',
+    'dojo/_base/declare',
+    'dgrid/Selection',
+    'dgrid/Grid',
+    'owfRt/widget/componentWithActionsFactory',
+    'dojo/Evented',
+    'owf/lang/compose',
+    'owf/view/NativeComponentProviderMixin'
+], function (objectUrl, Deferred, declare, Selection, Grid, componentWithActionsFactory, Evented, compose, NativeComponentProviderMixin) {
+    'use strict';
+
+    return compose(Evented, NativeComponentProviderMixin, {
+
+        /**
+         Uses a the row id to retrieve the row (photo) from the grid
+         * @param rowId
+         */
+        _getPhoto: function (rowId) {
+            return this.grid.row(rowId);
+        },
+
+        /**
+         * Removes the row (photo) from the grid
+         * @param rowId
+         */
+        _removePhoto: function (row) {
+            this.grid.removeRow(row);
+        },
+
+        initialise: function (componentNode) {
+            var self = this;
+            this.docFragNode = componentNode.getDocumentFragmentNode();
+
+            var definition = {};
+            definition.columns = [];
+            definition.formatters = [];
+            definition.columns.push({
+                width: 10
+            });
+
+            var CustomGrid = declare([Grid, Selection], {loadingIndicatorDisplayed: false});
+
+            this.grid = new CustomGrid({definition: definition, selectionMode: 'extended'});
+
+            this.grid.on('dgrid-select', function (event) {
+                var grid = event.grid;
+                if (grid.selectionMode === 'extended') {
+                    self.presenter.displayPhotoOnModal(event.rows[0].data);
+                    grid.deselect(event.rows[0].id);
+                }
+            });
+
+            this.grid.insertLoadingIndicator = function () {
+                if (this.loadingIndicatorDisplayed !== true) {
+                    var loadingIndicator = document.createElement('div');
+                    loadingIndicator.classList.add("placeHolder");
+                    var loadingIcon = document.createElement('div');
+                    loadingIcon.classList.add("large-icon", "icon-loading", "animate-spin", "colour-splash");
+                    loadingIndicator.appendChild(loadingIcon);
+
+                    if (this.contentNode.firstChild) {
+                        this.contentNode.insertBefore(loadingIndicator, this.contentNode.firstChild);
+                    }
+                    else {
+                        this.contentNode.appendChild(loadingIndicator);
+                    }
+                    this.loadingIndicatorDisplayed = true;
+                }
+            };
+
+            this.grid.removeLoadingIndicator = function () {
+                if (this.loadingIndicatorDisplayed) {
+                    this.loadingIndicatorDisplayed = false;
+                    if (this.contentNode.firstChild) {
+                        this.contentNode.removeChild(this.contentNode.firstChild);
+                    }
+                }
+            };
+
+            this.grid.renderRow = function (item) {
+                function imageLoader(src) {
+                    var df = new Deferred();
+                    var img = new Image();
+                    img.onload = function () {
+                        df.resolve(img);
+                    };
+                    img.onerror = function () {
+                        df.reject(img);
+                    };
+                    img.src = src;
+                    return df.promise;
+                }
+
+                function releasePreviousImage(img) {
+                    // in order for safaris memory management to clear the previous image from memory
+                    // the width and height need to be set to 1 (low size means low memory usage) and its source
+                    // needs to point to a blank directory (so no reference is left)
+                    // https://bugs.webkit.org/show_bug.cgi?id=31253
+                    img.src = '//:0';
+                    img.width = 1;
+                    img.height = 1;
+                }
+
+                // ensure image dimensions dont exceed limitations (ios)
+                function protect(img) {
+                    var ratio = img.width / img.height;
+
+                    var maxSquare = 5000000;  // ios max canvas square
+                    var maxSize = 4096;  // ie max canvas dimensions
+
+                    var maxW = Math.floor(Math.sqrt(maxSquare * ratio));
+                    var maxH = Math.floor(maxSquare / Math.sqrt(maxSquare * ratio));
+                    if (maxW > maxSize) {
+                        maxW = maxSize;
+                        maxH = Math.round(maxW / ratio);
+                    }
+                    if (maxH > maxSize) {
+                        maxH = maxSize;
+                        maxW = Math.round(ratio * maxH);
+                    }
+                    if (img.width > maxW) {
+                        var canvas = document.createElement('canvas');
+                        canvas.width = maxW;
+                        canvas.height = maxH;
+                        canvas.getContext('2d').drawImage(img, 0, 0, maxW, maxH);
+                        releasePreviousImage(img);
+                        img = canvas;
+                    }
+
+                    return img;
+                }
+
+                // downscales images for thumbnails.
+                // for a detailed description of the solution go to
+                // https://blog.uploadcare.com/image-resize-in-browsers-is-broken-e38eed08df01
+                function resize(img, w, h) {
+                    var d = new Deferred();
+
+                    // If we rush straight ahead and resize a good deal of images in a row,
+                    // a browser will just freeze up until the very end of the procedure.
+                    // We use setTimeout() after each step to keep workflow responsive.
+                    setTimeout(function () {
+                        img = protect(img);
+
+                        console.log(img.width, img.height);
+
+                        var steps = Math.ceil(Math.log2(img.width / w));
+                        var sW = w * Math.pow(2, steps - 1);
+                        var sH = h * Math.pow(2, steps - 1);
+                        var x = 2;
+
+                        function run() {
+                            if (!(steps--)) {
+                                d.resolve(img);
+                                return;
+                            }
+
+                            setTimeout(function () {
+                                console.log(sW, sH);
+                                var canvas = document.createElement('canvas');
+                                canvas.width = sW;
+                                canvas.height = sH;
+                                canvas.getContext('2d').drawImage(img, 0, 0, sW, sH);
+                                releasePreviousImage(img);
+                                img = canvas;
+
+                                sW = Math.round(sW / x);
+                                sH = Math.round(sH / x);
+                                run();
+                            }, 0);
+                        }
+
+                        run();
+                    }, 0);
+                    return d;
+                }
+
+                var d = new Deferred();
+
+                var op = imageLoader(objectUrl.createObjectURL(item.photo));
+                op.then(function (img) {
+                    var origSrc = img.src;
+                    console.log('Image Loaded');
+                    var width = 120;
+                    var height = Math.round(width * img.height / img.width);
+                    return resize(img, width, height).then(function (canvas) {
+                        canvas.classList.add("thumbnail");
+
+                        // Release object url to let the browser know not to keep the reference to the file any longer.
+                        // This leaves the underlying objects in place and allows the platform to handle garbage collection at an appropriate time.
+                        objectUrl.revokeObjectURL(origSrc);
+
+                        console.log('Image added to Fragment');
+                        d.resolve(canvas);
+                    });
+                }, function () {
+                    // This may occur if the image was corrupted during download.
+                    console.log('Image failed to load');
+                    // resolve with a 'problem' icon so user knows the image is corrupt
+                    var element = document.createElement('div');
+                    element.innerText = 'Unable to load image.';
+                    element.classList.add("corruptImage");
+                    d.resolve(element);
+                });
+
+                return d;
+            };
+
+            this.grid.insertRow = function (object, parent) {
+                var id = this.id + "-row-" + "" + this._autoRowId++,
+                    row = document.getElementById(id);
+
+                if (row) {// if it existed elsewhere in the DOM, we will remove it, so we can recreate it
+                    this.removeRow(row);
+                }
+
+                return this.renderRow(object).then(function (row) {
+
+                    row.className = (row.className || "") + " ui-state-default dgrid-row";
+                    // get the row id for easy retrieval
+                    this._rowIdToObject[row.id = id] = object;
+
+                    if (this.loadingIndicatorDisplayed) {
+                        parent.insertBefore(row, parent.firstChild.nextSibling);
+                    } else {
+                        if (parent.firstChild) {
+                            parent.insertBefore(row, parent.firstChild);
+                        }
+                        else {
+                            parent.appendChild(row);
+                        }
+                    }
+
+                    return row;
+                }.bind(this));
+
+            };
+
+            this.grid.renderArray = function (results) {
+                var self = this;
+
+                var chain = new Deferred();
+                chain.resolve([]);
+                results.forEach(function (obj) {
+                    chain = chain.then(function () {
+                        return self.insertRow(obj, self.contentNode);
+                    });
+                });
+
+                return chain.then(function (resolvedRows) {
+                    var lastRow = resolvedRows[resolvedRows.length - 1];
+                    lastRow && self.adjustRowIndices(lastRow);
+                    return true;
+                });
+            };
+
+            this.grid.startup = function () {
+            };
+
+            var ListWithActions = componentWithActionsFactory(this.grid, this);
+
+            var nativeComponent = new ListWithActions({}, componentNode.getNativeNode());
+
+            this.setNativeComponent(nativeComponent);
+        },
+
+        /**
+         * Prepends an image to the image grid
+         * @param photo
+         * @returns {*}
+         */
+        displayPhoto: function (photo) {
+            return this.grid.insertRow(photo, this.grid.contentNode);
+        },
+
+        /**
+         * Iterates through a list of images, prepending each one to the image grid.
+         * @param list
+         * @returns {*}
+         */
+        displayPhotos: function (list) {
+            return this.grid.renderArray(list);
+        },
+
+        /**
+         * Prepends the loading indicator to the image grid
+         */
+        displayLoadingIndicator: function () {
+            this.grid.insertLoadingIndicator();
+        },
+
+        /**
+         * Removes the loading indicator from the image grid
+         */
+        removeLoadingIndicator: function () {
+            this.grid.removeLoadingIndicator();
+        },
+
+        /**
+         * Enables toggle selection so multiple photos can be selected at a time.
+         */
+        activateToggleSelection: function () {
+            this.grid.set('selectionMode', 'toggle');
+        },
+
+        /**
+         * Enables single selection so only one photo can be selected at a time.
+         */
+        activateSingleSelection: function () {
+            this.grid.set('selectionMode', 'extended');
+        },
+
+        /**
+         * Removes selected photos from display and returns the ids of the photos removed
+         * @returns {Array}
+         */
+        removeSelectedPhotos: function () {
+            var photoIdsForRemoval = [];
+            var loCode;
+            var localSurveyId;
+            var selectedPhotos = Object.keys(this.grid.selection);
+
+            selectedPhotos.forEach(function (displayId) {
+                // should we have to rely on the view for actual data?
+                var photo = this._getPhoto(displayId);
+                photoIdsForRemoval.push(photo.data.id);
+                loCode = photo.data.lo_code;
+                localSurveyId = photo.data.local_survey_id;
+                this._removePhoto(photo);
+            }, this);
+
+            return photoIdsForRemoval;
+
+        },
+
+        /**
+         * Removes grid from dom
+         */
+        destroy: function () {
+            this.grid.destroy();
+        }
+
+    });
+});
