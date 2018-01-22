@@ -1,0 +1,317 @@
+define([
+    'pmm/app/utils/objectUrl',
+    'pmm/app/config',
+    'pmm/app/comp/modal',
+    'dojo/string',
+    'pmm/common/timestampFormatter',
+    'owfRt/form/FormManager',
+    'owf/lang/getSetMixin',
+    'dojo/Deferred',
+    'owf/lang/async',
+    'pmm/app/auth/userCredentials',
+    'owf/lang/compose',
+    'owf/presenter/DataBoundMixin',
+    'pmm/owcRt/app/NavigatorPresenterMixin',
+    'pmm/owcRt/comp/headerManager',
+    'pmm/view!/photos/PhotosView',
+    'owfRt/form/addActionsAsFormControlsMixin',
+    'dojo/text!pmm/owcRt/comp/photos/photoViewerTemplate.html'
+], function (objectUrl, config, modal, string, timestampFormatter, FormManager, getSetMixin, Deferred, async, userCredentials, compose, DataBoundMixin, NavigatorPresenterMixin, headerManager, PhotosView, addActionsAsFormControlsMixin, photoViewerTemplate) {
+    'use strict';
+
+    return compose(NavigatorPresenterMixin, DataBoundMixin, getSetMixin('FormManager', true), addActionsAsFormControlsMixin, function (surveyPhotoServiceProvider) {
+            this.surveyPhotoServiceProvider = surveyPhotoServiceProvider;
+        },
+        {
+            View: PhotosView,
+
+            defnExtractor: function () {
+                return {};
+            },
+
+            backEnabled: true,
+
+            definition: {},
+
+            photoQuota: config.photos.maxPerSurvey,
+
+            _activateRemovePhotosState: function () {
+                this.context.getAction('Delete').show();
+                this.context.getAction('Cancel').show();
+                this.context.getAction('Add').hide();
+                this.context.getAction('Remove').hide();
+            },
+
+            _activateAddPhotosState: function () {
+                this.context.getAction('Delete').hide();
+                this.context.getAction('Cancel').hide();
+                this.context.getAction('Add').show();
+                this.context.getAction('Remove').show();
+            },
+
+            _disableInteraction: function () {
+                this.context.getAction('Delete').setEnabled(false);
+                this.context.getAction('Cancel').setEnabled(false);
+                this.context.getAction('Add').setEnabled(false);
+                this.context.getAction('Remove').setEnabled(false);
+            },
+
+            _enableInteraction: function () {
+                this.context.getAction('Delete').setEnabled(true);
+                this.context.getAction('Cancel').setEnabled(true);
+                this.context.getAction('Add').setEnabled(true);
+                this.context.getAction('Remove').setEnabled(true);
+            },
+
+            /**
+             * Checks that with the new images added to the previously stored count, the limit is not exceed.
+             * @private
+             */
+            _isMaxPhotoCountExceeded: function (newlyAddedPhotoCount) {
+                var self = this;
+                return this.surveyPhotoServiceProvider.fetchPhotoCount(this.lo_code, this.local_survey_id).then(function determineIfMaxPhotoCountExceeded(currentPhotoCount) {
+                    if ((currentPhotoCount + newlyAddedPhotoCount) > self.photoQuota) {
+                        alert('Unable to save photos. Exceeded limit of: ' + self.photoQuota + ' photos per survey. ' +
+                            currentPhotoCount + ' photos currently stored for this survey.');
+                        return true;
+                    } else {
+                        return false;
+                    }
+                });
+            },
+
+            _flagRowAsDirty: function () {
+                var model = this.context.getDataAccessor().getCurrentRowModel();
+                model.set('dirty', true);
+            },
+
+            getDataDefinition: function () {
+                return {useLinkModelMode: 'currentRowModel'};
+            },
+
+            preInitialise: function () {
+                this.setFormManager(new FormManager());
+            },
+
+            initialise: function () {
+                var self = this;
+
+                this.view.initialise(this.context.getNode());
+
+                this.setReadyForData();
+
+                self.setupTitleHandler();
+            },
+
+            createMetadata: function () {
+                var self = this;
+                return userCredentials.getUsername().then(function constructPhotoMetadata(username) {
+                    return {
+                        timestamp: new Date().toISOString(),
+                        user: username,
+                        lo_code: self.lo_code,
+                        local_survey_id: self.local_survey_id,
+                        state: self.surveyPhotoServiceProvider.PHOTO_STATE_ENUM.ADDED
+                    };
+                });
+            },
+
+            initialiseData: function (dataAccessor) {
+                var self = this;
+
+                this._disableInteraction();
+                this.view.displayLoadingIndicator();
+                async.when(dataAccessor.getCurrentRowModel(), function (row) {
+                        self.lo_code = row.lo_code;
+                        self.local_survey_id = row.local_survey_id;
+
+                        self.surveyPhotoServiceProvider.fetchPhotos(self.lo_code, self.local_survey_id).then(function (photoArr) {
+                            // check presenter still has view at this point as user may have navigated away before previous promise was resolved
+                            if (self.view) {
+                                return self.view.displayPhotos(photoArr);
+                            }
+                        }).then(function () {
+                            self._enableInteraction();
+                            // check presenter still has view at this point as user may have navigated away before previous promise was resolved
+                            if (self.view) {
+                                self.view.removeLoadingIndicator();
+                            }
+                        });
+
+                    }.bind(this), console.error);
+            },
+
+            /**
+             * Saves photos and returns there ids within indexeddb
+             * @param files
+             */
+            savePhotos: function (files) {
+                var self = this;
+                var chain = new Deferred();
+                var ids = [];
+                chain.resolve();
+                var images = [].filter.call(files, function (f) {
+                    return f.type.match('image.*');
+                });
+                images
+                    .forEach(function (f, i) {
+                        var j = i + 1;
+                        // Instead of creating a new FileReader for each photo at once append to the promise callback
+                        // so we created them one by one
+                        chain = chain.then(function loadImage() {
+                            console.log('Loading image #' + j + ' into FileReader');
+                            var d = new Deferred();
+                            var reader = new FileReader();
+                            reader.onload = (function (file) {
+                                // Closure keeps a reference to file whilst we're waiting for the load event
+                                return function (loadEvent) {
+
+                                    async.when(self.createMetadata(), function savePhoto(metadata) {
+                                        self.surveyPhotoServiceProvider.save(new Blob([loadEvent.target.result], {type: file.type}), metadata).then(function (id) {
+                                            console.log('Image #' + j + ' saved to IDB');
+                                            ids.push(id);
+                                            d.resolve();
+                                        });
+                                    });
+
+                                };
+                            })(f);
+                            // readAsArrayBuffer will give us a pointer to the FileSystem blob
+                            reader.readAsArrayBuffer(f);
+                            return d;
+                        });
+                    });
+
+                return chain.then(function () {
+                    return ids;
+                });
+
+            },
+
+            /**
+             * Displays any photos in indexeddb with the corresponding ids
+             * @param ids
+             */
+            displayPhotos: function (ids) {
+                var self = this;
+                var displayChain = new Deferred();
+                displayChain.resolve();
+                ids.forEach(function (id) {
+                    displayChain = displayChain
+                        .then(function () {
+                            console.log('processing' + id);
+                            return self.surveyPhotoServiceProvider.fetchPhoto(id).then(function (record) {
+                                var def = new Deferred();
+
+                                setTimeout(function () {
+                                    // check presenter still has view at this point as user may have navigated away before previous promise was resolved
+                                    if (self.view) {
+                                        self.view.displayPhoto(record).then(def.resolve);
+                                    }
+                                }, 0);
+
+                                return def;
+                            });
+                        });
+                });
+                return displayChain;
+            },
+
+            msg_addPhotos: function (msg) {
+                var files = msg.files;
+                var self = this;
+                return self._isMaxPhotoCountExceeded(files.length).then(function (photoCountExceed) {
+                    if (!photoCountExceed) {
+                        self._disableInteraction();
+                        self.view.displayLoadingIndicator();
+                        return self.savePhotos(files).then(function (ids) {
+                            self._flagRowAsDirty();
+                            return self.displayPhotos(ids).then(function () {
+                                console.log('All newly added images displayed');
+                                self._enableInteraction();
+                                self.view.removeLoadingIndicator();
+                            });
+                        });
+                    }
+                });
+            },
+
+            msg_activateRemovePhotosState: function () {
+                this.view.activateToggleSelection();
+                this._activateRemovePhotosState();
+            },
+
+            msg_activateAddPhotosState: function () {
+                this.view.activateSingleSelection();
+                this._activateAddPhotosState();
+            },
+
+            msg_removePhotos: function () {
+                var self = this;
+                var photoIdsForRemoval = this.view.removeSelectedPhotos();
+                if (photoIdsForRemoval.length > 0) {
+                    this.surveyPhotoServiceProvider.removePhotosWithIds(photoIdsForRemoval).then(function(){
+                        modal.load({info:true});
+                        modal.setMessage("All photos successfully removed");
+                        self.view.activateSingleSelection();
+                        self._activateAddPhotosState();
+                    }, function(){
+                        modal.load({info:true});
+                        modal.setMessage("Problem encountered while removing photos. Please check logs for further details");
+                    });
+                }else{
+                    modal.load({info:true});
+                    modal.setMessage("Please select photos to delete");
+                }
+            },
+
+            displayPhotoOnModal: function (img) {
+                var src = objectUrl.createObjectURL(img.photo);
+                var time = timestampFormatter.toString(img.timestamp);
+                var photoTemplateHtml = string.substitute(photoViewerTemplate, {
+                    imgSrc: src,
+                    username: img.user,
+                    timestamp: time
+                });
+                modal.load({
+                    content: photoTemplateHtml,
+                    onModalSelect: function () {
+                        objectUrl.revokeObjectURL(src);
+                    }
+                });
+            },
+
+            /**
+             * @param message
+             */
+            updateTitle: function (message) {
+                if (message.location) {
+                    headerManager.setHeaderData(message.location.getName(), true);
+                }
+            },
+
+            getMessageDefns: function () {
+                return [
+                    {
+                        topic: 'activateRemovePhotosState'
+                    },
+                    {
+                        topic: 'activateAddPhotosState'
+                    },
+                    {
+                        topic: 'addPhotos'
+                    },
+                    {
+                        topic: 'removePhotos'
+                    }
+
+                ];
+            },
+
+            destroy: function () {
+                this.view.destroy();
+            }
+
+        });
+
+});
