@@ -1,0 +1,82 @@
+define([
+    'owf/lang/async',
+    'owf/lang/Deferred',
+    'dojo/_base/declare'
+], function (async, Deferred, declare) {
+    // jshint strict: false
+
+    return declare(null,
+        {
+            /**
+             * Retrieves photos (blobs) from server
+             * @param token
+             * @param path
+             * @param onSuccessCallback - triggered after successful download
+             * @param onErrCallback - triggered if download fails
+             */
+            download: function (token, path, onSuccessCallback, onErrCallback) {
+                var req = new XMLHttpRequest();
+                req.open('GET', path, true);
+                req.setRequestHeader('x-access-token', token);
+                req.responseType = 'blob'; // We want the response as a blob
+
+                req.onload = function (event) {
+                    // Save it to IDB
+                    onSuccessCallback(event.target.response);
+                }.bind(this);
+
+                req.onerror = function (event) {
+                    // Save it to IDB
+                    onErrCallback(event.target.response);
+                }.bind(this);
+
+                req.send();
+
+            },
+
+            /**
+             * Sends photos to server
+             * @param token
+             * @param path
+             * @param data
+             * @param successCb - triggered after successful upload and before upload method is resolved.
+             * @returns {*}
+             */
+            upload: function (token, path, data, successCb) {
+                var deferred = new Deferred();
+                var fd = new FormData();
+
+                // populate form data
+                for (var key in data) {
+                    if (data.hasOwnProperty(key)) {
+                        fd.append(key, data[key]);
+                    }
+                }
+
+                var req = new XMLHttpRequest();
+                req.open('POST', path, true);
+                req.setRequestHeader('x-access-token', token);
+                req.onload = function (event) {
+                    if (event.target.status === 200) {
+                        // log successful photo upload
+                        console.log('success');
+                        async.when(successCb(), function (value) {
+                            deferred.resolve(value);
+                        });
+                    } else {
+                        console.error('status: ' + event.target.status + ' -' + event.target.statusText);
+                        deferred.reject();
+                    }
+                };
+                req.onerror = function (event) {
+                    // log failed photo upload
+                    console.error('status: ' + event.target.status + ' -' + event.target.statusText);
+                    deferred.reject();
+                };
+                req.send(fd);
+
+                return deferred;
+            }
+
+        });
+});
